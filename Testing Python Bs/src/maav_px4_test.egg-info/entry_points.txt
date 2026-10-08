@@ -1,0 +1,2 @@
+[console_scripts]
+maav-test = maav_test.cli:main

@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: maav-px4-test
+Version: 0.1.0
+Summary: Read-only MAVLink acceptance checks for MAAV PX4 vehicles
+Requires-Python: >=3.10
+Requires-Dist: pymavlink>=2.4.41
+Requires-Dist: pyserial>=3.5
