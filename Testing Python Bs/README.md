@@ -214,3 +214,18 @@ Motor-output, ELRS-loss/recovery, vibration-under-spin, power-cycle, and soak
 tests are intentionally not implemented in `full`. They need separate commands
 with a props-removed confirmation, physical safety interlock, a test fixture,
 and an explicit expected result/range for each aircraft.
+
+## RadioMaster arm test
+
+The arm test is separate from `full`. It sends the reviewed `Command.ARM`
+global-variable arm value of `1024` through the RadioMaster USB serial
+interface, then waits for PX4 to report the armed flag in `HEARTBEAT`. It then
+restores the ARM gvar to `-1024` (disarm), regardless of whether PX4 accepted the request. It
+does not command any motor output, but an armed aircraft can respond to later
+RC input, so remove props or securely restrain the vehicle before continuing.
+
+```bash
+maav-test --device /dev/tty.usbmodemXXXX \
+  --controller-device /dev/cu.usbmodem00000000001B1 \
+  --arm arm
+```

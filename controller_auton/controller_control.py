@@ -15,11 +15,11 @@ class Command(Enum):
     
 
 
-def send_message(gvar_idx, val):
+def send_message(gvar_idx, val, port=SERIAL_PORT, baudrate=115200):
     message = (gvar_idx.value[0] << 12) | (val + 1024)
     message = message.to_bytes(2, byteorder="little")
     
-    with serial.Serial(SERIAL_PORT, 115200, timeout=1) as ser:
+    with serial.Serial(port, baudrate, timeout=1) as ser:
         ser.write(message)
         ser.flush()
 

@@ -16,7 +16,7 @@ from .tests import PX4Tests
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Read-only PX4 MAVLink acceptance checks")
-    parser.add_argument("command", nargs="?", choices=["full", "shell", "motors"], help="test suite to run")
+    parser.add_argument("command", nargs="?", choices=["full", "shell", "motors", "arm"], help="test suite to run")
     parser.add_argument("shell_command", nargs=argparse.REMAINDER, help="read-only PX4 NSH command after 'shell'")
     parser.add_argument("--device", help="MAVLink serial device, e.g. /dev/tty.usbmodemXXXX")
     parser.add_argument("--baud", type=int, default=115200, help="serial baud rate (default: 115200)")
@@ -32,6 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--all-motors", action="store_true", help="test every configured motor sequentially")
     parser.add_argument("--motor-power", type=float, default=0.10, help="normalized motor test output, maximum 0.15")
     parser.add_argument("--motor-duration", type=float, default=2.0, help="per-motor duration in seconds, maximum 5")
+    parser.add_argument("--controller-device", help="RadioMaster USB serial device used for gvar commands")
+    parser.add_argument("--arm", action="store_true", help="enable the separately safety-gated ARM test")
     return parser
 
 
@@ -80,6 +82,16 @@ def main(argv: list[str] | None = None) -> int:
         except MotorSafetyError as error:
             print(f"Motor safety check failed: {error}", file=sys.stderr)
             return 2
+    if args.command == "arm":
+        if not args.arm:
+            print("Refusing to arm: pass --arm", file=sys.stderr)
+            return 2
+        if not safety_context.vehicle_secured:
+            print("Arm safety check failed: props must be removed or the vehicle securely restrained", file=sys.stderr)
+            return 2
+        if not args.controller_device:
+            print("Arm safety check failed: pass --controller-device PATH", file=sys.stderr)
+            return 2
     try:
         device = args.device or discover_pixhawk_device()
     except DeviceDiscoveryError as error:
@@ -119,7 +131,13 @@ def main(argv: list[str] | None = None) -> int:
                 args.golden_config,
                 args.require_peripherals,
                 safety_context,
+                args.controller_device,
             )
+            if args.command == "arm":
+                connection.wait_for_heartbeat()
+                result = tests.test_arm()
+                print_result(result)
+                return 1 if result.status is Status.FAIL else 0
             results = tests.run_full()
             if args.export_config:
                 parameters = tests.parameter_snapshot or connection.request_all_parameters()

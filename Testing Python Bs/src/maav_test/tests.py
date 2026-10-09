@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 import re
+import sys
+import time
 from typing import Any
 
 from pymavlink import mavutil
@@ -27,6 +30,18 @@ GPS_FIX_NAMES = {
 }
 
 
+def _controller_control_module() -> Any:
+    """Load the shared RadioMaster gvar command definitions from this repository."""
+    module_path = Path(__file__).resolve().parents[3] / "controller_auton" / "controller_control.py"
+    spec = importlib.util.spec_from_file_location("maav_controller_control", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load controller command definitions from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class PX4Tests:
     """A compact test suite that reports facts without changing vehicle state."""
 
@@ -37,12 +52,14 @@ class PX4Tests:
         golden_config: Path | None = None,
         require_peripherals: bool = False,
         safety_context: SafetyContext | None = None,
+        controller_device: str | None = None,
     ) -> None:
         self.connection = connection
         self.show_coordinates = show_coordinates
         self.golden_config = golden_config
         self.require_peripherals = require_peripherals
         self.safety_context = safety_context
+        self.controller_device = controller_device
         self.parameter_snapshot: dict[str, int | float] | None = None
 
     def test_connection(self) -> TestResult:
@@ -220,6 +237,48 @@ class PX4Tests:
             )
         )
         return results
+
+    def test_arm(self) -> TestResult:
+        """Arm through the RadioMaster USB global-variable control path.
+
+        This test is deliberately excluded from ``full`` and is reachable only
+        through the CLI's separately safety-gated ``arm`` command.
+        """
+        if self.safety_context is None or not self.safety_context.vehicle_secured:
+            return TestResult("ARM", Status.FAIL, "Vehicle safety confirmation was not accepted")
+        if not self.controller_device:
+            return TestResult("ARM", Status.FAIL, "No RadioMaster controller serial device was supplied")
+        try:
+            controller = _controller_control_module()
+            # ARM is a switch gvar. The reviewed model mapping arms at +1024.
+            controller.send_message(controller.Command.ARM, 1024, port=self.controller_device)
+        except (OSError, ValueError) as error:
+            return TestResult("ARM", Status.FAIL, f"Could not send RadioMaster arm command: {error}")
+
+        deadline = time.monotonic() + self.connection.timeout
+        armed = False
+        while time.monotonic() < deadline:
+            heartbeat = self.connection.receive("HEARTBEAT")
+            if heartbeat is None:
+                continue
+            if heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED:
+                armed = True
+                break
+
+        try:
+            # Always return the tested switch to its reviewed disarm value.
+            controller.send_message(controller.Command.ARM, -1024, port=self.controller_device)
+        except (OSError, ValueError) as error:
+            return TestResult("ARM", Status.FAIL, f"Could not restore the ARM gvar to off: {error}")
+
+        details = [
+            f"Controller: {self.controller_device}",
+            "Command: ARM = 1024",
+            "ARM gvar restored to -1024 (disarm)",
+        ]
+        if armed:
+            return TestResult("ARM", Status.PASS, "PX4 reported armed after the RadioMaster ARM gvar command", details)
+        return TestResult("ARM", Status.FAIL, "PX4 did not report armed before the timeout", details)
 
     def run_full(self) -> list[TestResult]:
         results = [self.test_connection()]
