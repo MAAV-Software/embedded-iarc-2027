@@ -15,25 +15,47 @@ from .tests import PX4Tests
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Read-only PX4 MAVLink acceptance checks")
-    parser.add_argument("command", nargs="?", choices=["full", "shell", "motors", "arm"], help="test suite to run")
-    parser.add_argument("shell_command", nargs=argparse.REMAINDER, help="read-only PX4 NSH command after 'shell'")
-    parser.add_argument("--device", help="MAVLink serial device, e.g. /dev/tty.usbmodemXXXX")
-    parser.add_argument("--baud", type=int, default=115200, help="serial baud rate (default: 115200)")
-    parser.add_argument("--timeout", type=float, default=5.0, help="per-request timeout in seconds (default: 5)")
-    parser.add_argument("--list-ports", action="store_true", help="list serial ports and exit")
-    parser.add_argument("--show-coordinates", action="store_true", help="include GPS coordinates in the report")
-    parser.add_argument("--golden-config", type=Path, help="JSON parameter snapshot to compare during full")
-    parser.add_argument("--export-config", type=Path, help="write the complete live parameter snapshot as JSON")
-    parser.add_argument("--require-peripherals", action="store_true", help="treat missing battery/GPS/mag/RC/ESC hardware as FAIL")
-    parser.add_argument("--spin-motors", action="store_true", help="enable motor-output tests; requires additional safety confirmation")
-    parser.add_argument("--confirm-props-removed", action="store_true", help="non-interactively confirm motor-test safety (for fixtures/CI)")
-    parser.add_argument("--motor", type=int, action="append", default=[], help="motor number to test (repeatable, 1..12)")
-    parser.add_argument("--all-motors", action="store_true", help="test every configured motor sequentially")
-    parser.add_argument("--motor-power", type=float, default=0.10, help="normalized motor test output, maximum 0.15")
-    parser.add_argument("--motor-duration", type=float, default=2.0, help="per-motor duration in seconds, maximum 5")
-    parser.add_argument("--controller-device", help="RadioMaster USB serial device used for gvar commands")
-    parser.add_argument("--arm", action="store_true", help="enable the separately safety-gated ARM test")
+    def add_connection_options(target: argparse.ArgumentParser, defaults: bool) -> None:
+        default = None if defaults else argparse.SUPPRESS
+        target.add_argument("--device", default=default, help="Pixhawk MAVLink serial device")
+        target.add_argument(
+            "--baud", type=int, default=115200 if defaults else argparse.SUPPRESS,
+            help="MAVLink baud rate (default: 115200)",
+        )
+        target.add_argument(
+            "--timeout", type=float, default=5.0 if defaults else argparse.SUPPRESS,
+            help="request timeout in seconds (default: 5)",
+        )
+        target.add_argument(
+            "--list-ports", action="store_true", default=False if defaults else argparse.SUPPRESS,
+            help="list serial ports and exit",
+        )
+
+    parser = argparse.ArgumentParser(description="MAAV PX4 checks")
+    add_connection_options(parser, defaults=True)
+    commands = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    full = commands.add_parser("full", help="run read-only PX4 checks")
+    add_connection_options(full, defaults=False)
+    full.add_argument("--show-coordinates", action="store_true", help="include GPS coordinates")
+    full.add_argument("--golden-config", type=Path, help="compare parameters with this JSON snapshot")
+    full.add_argument("--export-config", type=Path, help="write the live parameter snapshot to JSON")
+    full.add_argument("--require-peripherals", action="store_true", help="treat missing optional hardware as failures")
+
+    shell = commands.add_parser("shell", help="run an allowed read-only PX4 NSH command")
+    add_connection_options(shell, defaults=False)
+    shell.add_argument("shell_command", nargs=argparse.REMAINDER, help="PX4 NSH command")
+
+    motors = commands.add_parser("motors", help="test motors with an interactive safety confirmation")
+    add_connection_options(motors, defaults=False)
+    motors.add_argument("--motor", type=int, action="append", default=[], help="motor number (repeatable, 1..12)")
+    motors.add_argument("--all", dest="all_motors", action="store_true", help="test every configured motor")
+    motors.add_argument("--power", type=float, default=0.10, help="normalized output, maximum 0.15")
+    motors.add_argument("--duration", type=float, default=2.0, help="seconds per motor, maximum 5")
+
+    arm = commands.add_parser("arm", help="test the RadioMaster ARM switch")
+    add_connection_options(arm, defaults=False)
+    arm.add_argument("controller_device", help="RadioMaster USB serial device")
     return parser
 
 
@@ -64,33 +86,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.timeout <= 0 or args.baud <= 0:
         print("--timeout and --baud must be positive.", file=sys.stderr)
         return 2
-    safety_context = SafetyContext(
-        vehicle_secured=confirm_vehicle_safety(args.confirm_props_removed)
-    )
+    safety_context: SafetyContext | None = None
     if args.command == "motors":
         try:
-            if not args.spin_motors:
-                raise MotorSafetyError("Refusing motor output: pass --spin-motors")
+            safety_context = SafetyContext(vehicle_secured=confirm_vehicle_safety())
             validate_motor_request(
-                args.spin_motors,
                 safety_context.vehicle_secured,
                 args.motor,
                 args.all_motors,
-                args.motor_power,
-                args.motor_duration,
+                args.power,
+                args.duration,
             )
         except MotorSafetyError as error:
             print(f"Motor safety check failed: {error}", file=sys.stderr)
             return 2
     if args.command == "arm":
-        if not args.arm:
-            print("Refusing to arm: pass --arm", file=sys.stderr)
-            return 2
+        safety_context = SafetyContext(vehicle_secured=confirm_vehicle_safety())
         if not safety_context.vehicle_secured:
             print("Arm safety check failed: props must be removed or the vehicle securely restrained", file=sys.stderr)
-            return 2
-        if not args.controller_device:
-            print("Arm safety check failed: pass --controller-device PATH", file=sys.stderr)
             return 2
     try:
         device = args.device or discover_pixhawk_device()
@@ -118,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
                 shell = PX4Shell(connection)
                 try:
                     results = MotorTests(shell, safety_context).run(
-                        args.motor, args.all_motors, args.motor_power, args.motor_duration
+                        args.motor, args.all_motors, args.power, args.duration
                     )
                 finally:
                     shell.close()
@@ -127,11 +140,11 @@ def main(argv: list[str] | None = None) -> int:
                 return 1 if any(result.status is Status.FAIL for result in results) else 0
             tests = PX4Tests(
                 connection,
-                args.show_coordinates,
-                args.golden_config,
-                args.require_peripherals,
+                getattr(args, "show_coordinates", False),
+                getattr(args, "golden_config", None),
+                getattr(args, "require_peripherals", False),
                 safety_context,
-                args.controller_device,
+                getattr(args, "controller_device", None),
             )
             if args.command == "arm":
                 connection.wait_for_heartbeat()
@@ -139,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
                 print_result(result)
                 return 1 if result.status is Status.FAIL else 0
             results = tests.run_full()
-            if args.export_config:
+            if getattr(args, "export_config", None):
                 parameters = tests.parameter_snapshot or connection.request_all_parameters()
                 write_snapshot(args.export_config, parameters)
                 print(f"\n[PASS] Wrote {len(parameters)} parameters to {args.export_config}")

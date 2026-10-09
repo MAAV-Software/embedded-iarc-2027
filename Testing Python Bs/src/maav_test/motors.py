@@ -22,15 +22,12 @@ class MotorSafetyError(ValueError):
 
 
 def validate_motor_request(
-    spin_motors: bool,
     safety_confirmed: bool,
     motors: list[int],
     all_motors: bool,
     power: float,
     duration: float,
 ) -> None:
-    if not spin_motors:
-        raise MotorSafetyError("Refusing motor output: pass --spin-motors")
     if not safety_confirmed:
         raise MotorSafetyError("Motor safety confirmation was not accepted")
     if not motors and not all_motors:
@@ -45,10 +42,8 @@ def validate_motor_request(
         raise MotorSafetyError(f"--motor-duration must be greater than 0 and no more than {MAX_DURATION_SECONDS} seconds")
 
 
-def confirm_vehicle_safety(non_interactive_confirmation: bool) -> bool:
+def confirm_vehicle_safety() -> bool:
     """Obtain the operator's physical-safety acknowledgement before MAVLink use."""
-    if non_interactive_confirmation:
-        return True
     try:
         answer = input("Are the props removed or is the drone securely strapped down? [y/N] ")
     except EOFError:
