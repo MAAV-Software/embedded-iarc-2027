@@ -29,6 +29,9 @@ GPS_FIX_NAMES = {
     8: "PPP",
 }
 
+ESC_TELEMETRY_SAMPLE_COUNT = 55
+ESC_TELEMETRY_TIMEOUT_SECONDS = 45.0
+
 
 def _controller_control_module() -> Any:
     """Load the shared RadioMaster gvar command definitions from this repository."""
@@ -50,7 +53,7 @@ class PX4Tests:
         connection: PX4Connection,
         show_coordinates: bool = False,
         golden_config: Path | None = None,
-        require_peripherals: bool = False,
+        require_peripherals: bool = True,
         safety_context: SafetyContext | None = None,
         controller_device: str | None = None,
     ) -> None:
@@ -137,6 +140,7 @@ class PX4Tests:
         if message is None:
             return TestResult("BATTERY", Status.FAIL, "BATTERY_STATUS timed out")
         voltages = [voltage for voltage in message.voltages if voltage != 0xFFFF]
+        live_voltages = [voltage for voltage in voltages if voltage > 0]
         details = [f"Battery ID: {message.id}", f"Status: {self._battery_status_name(message)}"]
         if voltages:
             details.append(f"Voltage: {sum(voltages) / 1000:.2f} V")
@@ -146,8 +150,12 @@ class PX4Tests:
             details.append(f"Current: {message.current_battery / 100:.2f} A")
         if message.battery_remaining != -1:
             details.append(f"Remaining: {message.battery_remaining}%")
-        status = Status.PASS if voltages else self._missing_peripheral_status()
-        summary = "Battery telemetry received" if voltages else "Battery telemetry received, but no battery voltage is available"
+        status = Status.PASS if live_voltages else self._missing_peripheral_status()
+        summary = (
+            "Live battery voltage received"
+            if live_voltages
+            else "Battery telemetry received, but the pack voltage is zero or unavailable"
+        )
         return TestResult("BATTERY", status, summary, details)
 
     def test_gps(self) -> TestResult:
@@ -216,27 +224,89 @@ class PX4Tests:
                 self._lines(rc, 8),
             )
         )
-        esc = shell.execute("listener esc_status -n 1")
-        esc_present = "timestamp:" in esc and self._has_nonzero_numeric_field(esc, "esc_voltage")
-        results.append(
-            TestResult(
-                "ESC TELEMETRY",
-                Status.PASS if esc_present else self._missing_peripheral_status(),
-                "ESC telemetry reports live electrical data" if esc_present else "No live ESC electrical telemetry (ESCs may be disconnected)",
-                self._lines(esc, 8),
-            )
-        )
-        dshot = shell.execute("dshot status")
-        supported = "not found" not in dshot.lower() and "not running" not in dshot.lower()
-        results.append(
-            TestResult(
-                "DSHOT OUTPUT",
-                Status.PASS if supported else Status.SKIP,
-                "dshot status received" if supported else "DShot driver is not active",
-                self._lines(dshot, 6),
-            )
-        )
+        results.append(self.test_bidirectional_dshot(shell))
         return results
+
+    def test_bidirectional_dshot(self, shell: PX4Shell) -> TestResult:
+        """Verify bidirectional DShot replies separately from pack power.
+
+        The DShot driver itself can run from USB-powered flight-controller
+        logic even when the ESC battery is absent. The BATTERY test verifies
+        pack voltage through the flight controller's power monitor; this test
+        verifies the bidirectional-DShot data path through reply counters.
+        """
+        dshot_before = shell.execute("dshot status")
+        if "bidirectional dshot enabled" not in dshot_before.lower():
+            return TestResult(
+                "BIDIRECTIONAL DSHOT / ESC TELEMETRY",
+                Status.FAIL,
+                "Bidirectional DShot is not enabled",
+                self._lines(dshot_before, 12),
+            )
+
+        original_timeout = self.connection.timeout
+        self.connection.timeout = max(original_timeout, ESC_TELEMETRY_TIMEOUT_SECONDS)
+        try:
+            telemetry = shell.execute(f"listener esc_status -n {ESC_TELEMETRY_SAMPLE_COUNT}")
+        finally:
+            self.connection.timeout = original_timeout
+        dshot_after = shell.execute("dshot status")
+
+        samples = self._esc_status_samples(telemetry)
+        if not samples:
+            return TestResult(
+                "BIDIRECTIONAL DSHOT / ESC TELEMETRY",
+                self._missing_peripheral_status(),
+                "No ESC status samples received",
+                self._lines(telemetry, 12),
+            )
+
+        esc_count = samples[0]["esc_count"]
+        expected_mask = (1 << esc_count) - 1
+        reply_before = self._dshot_reply_counts(dshot_before)
+        reply_after = self._dshot_reply_counts(dshot_after)
+        reply_deltas = {
+            channel: reply_after.get(channel, 0) - reply_before.get(channel, 0)
+            for channel in range(esc_count)
+        }
+        fresh_counters = len(samples) > 1 and all(
+            later["counter"] > earlier["counter"] for earlier, later in zip(samples, samples[1:])
+        )
+        online = all((sample["online_flags"] & expected_mask) == expected_mask for sample in samples)
+        fresh_reports = all(
+            len({sample["reports"].get(index, {}).get("timestamp", 0) for sample in samples}) > 1
+            for index in range(esc_count)
+        )
+        replies_advanced = all(delta > 0 for delta in reply_deltas.values())
+        details = [
+            f"ESC samples: {len(samples)} requested {ESC_TELEMETRY_SAMPLE_COUNT}",
+            f"ESC count: {esc_count}; online flags: 0x{samples[-1]['online_flags']:x}",
+            f"ESC status counters advanced: {'yes' if fresh_counters else 'no'}",
+            f"ESC report timestamps advanced: {'yes' if fresh_reports else 'no'}",
+            "Bidir DShot reply deltas: " + ", ".join(f"ch{channel}={delta}" for channel, delta in reply_deltas.items()),
+            "Pack voltage is validated separately by the BATTERY test (not esc_status).",
+        ]
+        if fresh_counters and online and fresh_reports and replies_advanced:
+            return TestResult(
+                "BIDIRECTIONAL DSHOT / ESC TELEMETRY",
+                Status.PASS,
+                "Bidirectional DShot replies verified on every configured output",
+                details,
+            )
+
+        missing: list[str] = []
+        if not replies_advanced:
+            missing.append("no new DShot replies from one or more ESC channels")
+        if not online:
+            missing.append("one or more ESCs were not online")
+        if not fresh_counters or not fresh_reports:
+            missing.append("ESC telemetry was not fresh across the sample window")
+        return TestResult(
+            "BIDIRECTIONAL DSHOT / ESC TELEMETRY",
+            self._missing_peripheral_status(),
+            "; ".join(missing),
+            details,
+        )
 
     def test_arm(self) -> TestResult:
         """Arm through the RadioMaster USB global-variable control path.
@@ -255,15 +325,7 @@ class PX4Tests:
         except (OSError, ValueError) as error:
             return TestResult("ARM", Status.FAIL, f"Could not send RadioMaster arm command: {error}")
 
-        deadline = time.monotonic() + self.connection.timeout
-        armed = False
-        while time.monotonic() < deadline:
-            heartbeat = self.connection.receive("HEARTBEAT")
-            if heartbeat is None:
-                continue
-            if heartbeat.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED:
-                armed = True
-                break
+        armed, arm_messages = self._wait_for_arm_result()
 
         try:
             # Always return the tested switch to its reviewed disarm value.
@@ -276,9 +338,92 @@ class PX4Tests:
             "Command: ARM = 1024",
             "ARM gvar restored to -1024 (disarm)",
         ]
+        details.extend(f"PX4: {message}" for message in arm_messages)
         if armed:
             return TestResult("ARM", Status.PASS, "PX4 reported armed after the RadioMaster ARM gvar command", details)
+        details.extend(self._preflight_failure_details(arm_messages))
         return TestResult("ARM", Status.FAIL, "PX4 did not report armed before the timeout", details)
+
+    def _wait_for_arm_result(self) -> tuple[bool, list[str]]:
+        """Wait for PX4's arm flag while retaining its diagnostic messages."""
+        master = self.connection._require_master()
+        deadline = time.monotonic() + self.connection.timeout
+        messages: list[str] = []
+        while time.monotonic() < deadline:
+            message = master.recv_match(blocking=True, timeout=min(0.25, deadline - time.monotonic()))
+            if message is None:
+                continue
+            if message.get_type() == "STATUSTEXT":
+                text = getattr(message, "text", "")
+                if isinstance(text, bytes):
+                    text = text.decode("utf-8", errors="replace")
+                text = str(text).strip("\x00 ")
+                if text and text not in messages and len(messages) < 20:
+                    messages.append(text)
+                continue
+            if message.get_type() == "HEARTBEAT" and (
+                message.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+            ):
+                return True, messages
+        return False, messages
+
+    def _preflight_failure_details(self, arm_messages: list[str]) -> list[str]:
+        """Collect read-only PX4 state that explains an arm rejection.
+
+        These commands run only after restoring the RadioMaster ARM gvar. They
+        neither alter PX4 parameters nor command actuators.
+        """
+        shell = PX4Shell(self.connection)
+        commands = (
+            ("PX4 preflight check", "commander check", 20),
+            ("PX4 vehicle status", "listener vehicle_status -n 1", 40),
+            ("PX4 estimator status", "listener estimator_status -n 1", 80),
+            ("PX4 estimator flags", "listener estimator_status_flags -n 1", 80),
+            ("PX4 magnetometer sample", "listener sensor_mag -n 1", 20),
+            ("PX4 RC input", "listener input_rc -n 1", 30),
+        )
+        details: list[str] = []
+        try:
+            for label, command, limit in commands:
+                try:
+                    output = shell.execute_controlled(command)
+                except (OSError, ShellError, TimeoutError) as error:
+                    details.append(f"{label} unavailable: {error}")
+                    continue
+                lines = self._lines(output, limit)
+                if lines:
+                    details.extend([f"{label}:", *lines])
+                else:
+                    details.append(f"{label}: no output")
+
+            try:
+                log_lines = self._preflight_log_lines(shell.execute_controlled("dmesg"))
+            except (OSError, ShellError, TimeoutError) as error:
+                details.append(f"PX4 relevant log entries unavailable: {error}")
+            else:
+                details.extend(["PX4 relevant log entries:", *log_lines] if log_lines else ["PX4 relevant log entries: none found"])
+        finally:
+            shell.close()
+        if arm_messages:
+            details.insert(0, "PX4 arm-rejection messages were captured above.")
+        return details
+
+    @staticmethod
+    def _preflight_log_lines(output: str) -> list[str]:
+        """Keep the useful, compact subset of the PX4 boot/log buffer."""
+        markers = (
+            "preflight",
+            "arming denied",
+            "health_and_arming_checks",
+            "magnet",
+            "compass",
+            "qmc",
+            "ekf",
+            "calibrat",
+            "no device",
+        )
+        lines = [line.strip() for line in output.splitlines() if any(marker in line.lower() for marker in markers)]
+        return lines[-30:]
 
     def run_full(self) -> list[TestResult]:
         results = [self.test_connection()]
@@ -317,9 +462,48 @@ class PX4Tests:
         return Status.FAIL if self.require_peripherals else Status.SKIP
 
     @staticmethod
-    def _has_nonzero_numeric_field(output: str, field: str) -> bool:
-        values = re.findall(rf"{re.escape(field)}:\s*(-?\d+(?:\.\d+)?)", output)
-        return any(float(value) != 0.0 for value in values)
+    def _dshot_reply_counts(output: str) -> dict[int, int]:
+        """Return bidirectional-DShot reply counters by output channel."""
+        return {
+            int(channel): int(read_count)
+            for channel, read_count in re.findall(
+                r"Channel\s+(\d+):\s+read\s+(\d+)", output
+            )
+        }
+
+    @staticmethod
+    def _esc_status_samples(output: str) -> list[dict[str, Any]]:
+        """Parse PX4 ``listener esc_status`` output into small sample records."""
+        samples: list[dict[str, Any]] = []
+        for block in re.split(r"(?=TOPIC:\s+esc_status\b)", output):
+            counter = re.search(r"\bcounter:\s*(\d+)", block)
+            esc_count = re.search(r"\besc_count:\s*(\d+)", block)
+            online_flags = re.search(r"\besc_online_flags:\s*(\d+)", block)
+            if counter is None or esc_count is None or online_flags is None:
+                continue
+            reports: dict[int, dict[str, int | float]] = {}
+            for report in re.finditer(
+                r"esc\[(\d+)\]\s+\(esc_report\):(?P<body>.*?)(?=\n\s*esc\[|\Z)",
+                block,
+                flags=re.DOTALL,
+            ):
+                timestamp = re.search(r"\btimestamp:\s*(\d+)", report.group("body"))
+                voltage = re.search(r"\besc_voltage:\s*(-?\d+(?:\.\d+)?)", report.group("body"))
+                if timestamp is None or voltage is None:
+                    continue
+                reports[int(report.group(1))] = {
+                    "timestamp": int(timestamp.group(1)),
+                    "voltage": float(voltage.group(1)),
+                }
+            samples.append(
+                {
+                    "counter": int(counter.group(1)),
+                    "esc_count": int(esc_count.group(1)),
+                    "online_flags": int(online_flags.group(1)),
+                    "reports": reports,
+                }
+            )
+        return samples
 
     @staticmethod
     def _battery_status_name(message: Any) -> str:

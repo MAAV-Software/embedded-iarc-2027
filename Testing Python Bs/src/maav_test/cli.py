@@ -40,7 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
     full.add_argument("--show-coordinates", action="store_true", help="include GPS coordinates")
     full.add_argument("--golden-config", type=Path, help="compare parameters with this JSON snapshot")
     full.add_argument("--export-config", type=Path, help="write the live parameter snapshot to JSON")
-    full.add_argument("--require-peripherals", action="store_true", help="treat missing optional hardware as failures")
+    full.add_argument(
+        "--bench",
+        action="store_true",
+        help="skip checks for peripherals intentionally absent from a bench setup",
+    )
 
     shell = commands.add_parser("shell", help="run an allowed read-only PX4 NSH command")
     add_connection_options(shell, defaults=False)
@@ -142,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
                 connection,
                 getattr(args, "show_coordinates", False),
                 getattr(args, "golden_config", None),
-                getattr(args, "require_peripherals", False),
+                not getattr(args, "bench", False),
                 safety_context,
                 getattr(args, "controller_device", None),
             )
