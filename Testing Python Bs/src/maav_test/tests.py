@@ -230,19 +230,25 @@ class PX4Tests:
     def test_bidirectional_dshot(self, shell: PX4Shell) -> TestResult:
         """Verify bidirectional DShot replies separately from pack power.
 
-        The DShot driver itself can run from USB-powered flight-controller
-        logic even when the ESC battery is absent. The BATTERY test verifies
-        pack voltage through the flight controller's power monitor; this test
-        verifies the bidirectional-DShot data path through reply counters.
+        The flight controller sends DShot on USB power alone, but ESCs only
+        reply when they are powered, so this test needs the pack connected.
+        The BATTERY test verifies pack voltage through the flight controller's
+        power monitor; this test verifies the bidirectional-DShot data path
+        through per-channel reply counters.
         """
-        dshot_before = shell.execute("dshot status")
-        if "bidirectional dshot enabled" not in dshot_before.lower():
-            return TestResult(
-                "BIDIRECTIONAL DSHOT / ESC TELEMETRY",
-                Status.FAIL,
-                "Bidirectional DShot is not enabled",
-                self._lines(dshot_before, 12),
-            )
+        name = "BIDIRECTIONAL DSHOT / ESC TELEMETRY"
+
+        # Learn how many ESCs PX4 expects before taking the "before" snapshot,
+        # so that snapshot can be retried until every channel parses.
+        probe = self._esc_status_samples(shell.execute("listener esc_status -n 1"))
+        if not probe:
+            return TestResult(name, self._missing_peripheral_status(), "No ESC status samples received")
+        esc_count = probe[0]["esc_count"]
+        channels = list(range(esc_count))
+
+        dshot_before, reply_before = self._read_dshot_reply_counts(shell, channels)
+        if "bidirectional dshot" not in dshot_before.lower() and not reply_before:
+            return TestResult(name, Status.FAIL, "Bidirectional DShot is not enabled", self._lines(dshot_before, 12))
 
         original_timeout = self.connection.timeout
         self.connection.timeout = max(original_timeout, ESC_TELEMETRY_TIMEOUT_SECONDS)
@@ -250,25 +256,33 @@ class PX4Tests:
             telemetry = shell.execute(f"listener esc_status -n {ESC_TELEMETRY_SAMPLE_COUNT}")
         finally:
             self.connection.timeout = original_timeout
-        dshot_after = shell.execute("dshot status")
+        dshot_after, reply_after = self._read_dshot_reply_counts(shell, channels)
+
+        unparsed = [
+            channel for channel in channels if channel not in reply_before or channel not in reply_after
+        ]
+        if unparsed:
+            # Never treat an unreadable counter as zero: that produces bogus deltas.
+            return TestResult(
+                name,
+                Status.FAIL,
+                "Could not read DShot reply counters for "
+                + ", ".join(f"ch{channel}" for channel in unparsed),
+                ["dshot status (before):", *self._lines(dshot_before, 20),
+                 "dshot status (after):", *self._lines(dshot_after, 20)],
+            )
 
         samples = self._esc_status_samples(telemetry)
         if not samples:
             return TestResult(
-                "BIDIRECTIONAL DSHOT / ESC TELEMETRY",
+                name,
                 self._missing_peripheral_status(),
                 "No ESC status samples received",
                 self._lines(telemetry, 12),
             )
 
-        esc_count = samples[0]["esc_count"]
         expected_mask = (1 << esc_count) - 1
-        reply_before = self._dshot_reply_counts(dshot_before)
-        reply_after = self._dshot_reply_counts(dshot_after)
-        reply_deltas = {
-            channel: reply_after.get(channel, 0) - reply_before.get(channel, 0)
-            for channel in range(esc_count)
-        }
+        reply_deltas = {channel: reply_after[channel] - reply_before[channel] for channel in channels}
         fresh_counters = len(samples) > 1 and all(
             later["counter"] > earlier["counter"] for earlier, later in zip(samples, samples[1:])
         )
@@ -283,7 +297,11 @@ class PX4Tests:
             f"ESC count: {esc_count}; online flags: 0x{samples[-1]['online_flags']:x}",
             f"ESC status counters advanced: {'yes' if fresh_counters else 'no'}",
             f"ESC report timestamps advanced: {'yes' if fresh_reports else 'no'}",
-            "Bidir DShot reply deltas: " + ", ".join(f"ch{channel}={delta}" for channel, delta in reply_deltas.items()),
+            *(
+                f"Output {index + 1} ({label}): read {reply_after[index]} (+{reply_deltas[index]} during test)"
+                + ("  <-- NO REPLIES" if reply_deltas[index] <= 0 else "")
+                for index, (label, _) in enumerate(self._dshot_reply_lines(dshot_after)[:esc_count])
+            ),
             "Pack voltage is validated separately by the BATTERY test (not esc_status).",
         ]
         if fresh_counters and online and fresh_reports and replies_advanced:
@@ -463,13 +481,47 @@ class PX4Tests:
 
     @staticmethod
     def _dshot_reply_counts(output: str) -> dict[int, int]:
-        """Return bidirectional-DShot reply counters by output channel."""
-        return {
-            int(channel): int(read_count)
-            for channel, read_count in re.findall(
-                r"Channel\s+(\d+):\s+read\s+(\d+)", output
-            )
-        }
+        """Return bidirectional-DShot reply counters by output channel.
+
+        Tolerates format variants such as ``Channel 0: read 123`` and
+        ``Channel 0: online, read 123, failed nibble 0, ...``.
+        """
+        return {index: count for index, (_, count) in enumerate(PX4Tests._dshot_reply_lines(output))}
+
+    @staticmethod
+    def _dshot_reply_lines(output: str) -> list[tuple[str, int]]:
+        """Return ``(label, read_count)`` per DShot output, in printed order.
+
+        PX4 may number channels per timer (``Timer 0 channel 1: read 0``), so
+        channel numbers repeat across timers. Outputs are therefore indexed by
+        the order they are printed, which follows the motor output order.
+        """
+        lines: list[tuple[str, int]] = []
+        for match in re.finditer(
+            r"(?:timer\s+(\d+)\W+)?channel\s+(\d+)\b[^\n]*?\bread\s+(\d+)",
+            output,
+            flags=re.IGNORECASE,
+        ):
+            timer, channel, count = match.groups()
+            label = f"timer {timer} ch {channel}" if timer is not None else f"ch {channel}"
+            lines.append((label, int(count)))
+        return lines
+
+    def _read_dshot_reply_counts(
+        self, shell: PX4Shell, channels: list[int], attempts: int = 3
+    ) -> tuple[str, dict[int, int]]:
+        """Run ``dshot status`` until every expected channel's counter parses.
+
+        Long MAVLink-shell output can arrive incomplete, silently dropping
+        ``Channel`` lines, so a single read is not trustworthy.
+        """
+        output, counts = "", {}
+        for _ in range(attempts):
+            output = shell.execute("dshot status")
+            counts = self._dshot_reply_counts(output)
+            if all(channel in counts for channel in channels):
+                break
+        return output, counts
 
     @staticmethod
     def _esc_status_samples(output: str) -> list[dict[str, Any]]:
